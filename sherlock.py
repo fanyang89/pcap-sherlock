@@ -38,10 +38,15 @@ FIELDS = [
     "tcp.analysis.duplicate_ack",
     "tcp.analysis.out_of_order",
     "tcp.analysis.zero_window",
+    "tcp.hdr_len",
+    "tcp.checksum",
+    "tcp.urgent_pointer",
+    "tcp.options",
 ]
 
 
 def initialize(db):
+    db.execute("PRAGMA temp_store = FILE")
     db.execute("""CREATE TABLE packets (
         source TEXT, file TEXT, frame INTEGER, ts REAL, wire INTEGER,
         captured INTEGER, src TEXT, sport INTEGER, dst TEXT, dport INTEGER,
@@ -61,8 +66,16 @@ def parse_row(row, source, filename, offset=0):
         "tcp.len",
         "tcp.flags",
         "tcp.window_size_value",
+        "tcp.stream",
+        "tcp.hdr_len",
+        "tcp.checksum",
+        "tcp.urgent_pointer",
     ]
     if not all(f[k] for k in required):
+        return None
+    header_length = int(f["tcp.hdr_len"])
+    options_length = len(bytes.fromhex(f["tcp.options"].replace(":", "")))
+    if not 20 <= header_length <= 60 or options_length < header_length - 20:
         return None
     src, dst = f["ip.src"] or f["ipv6.src"], f["ip.dst"] or f["ipv6.dst"]
     if not src or not dst:
@@ -125,9 +138,16 @@ def ingest(db, source, filename, offset=0):
         "file": str(filename),
         "offset_seconds": offset,
         "packets": 0,
+        "decoded_tcp_packets": 0,
         "incomplete_headers": 0,
         "truncated": 0,
+        "timestamp_regressions": 0,
+        "raw_start": None,
+        "raw_end": None,
+        "min_captured_length": None,
+        "max_captured_length": None,
     }
+    previous_timestamp = None
     with tempfile.TemporaryFile(mode="w+t") as errors:
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=errors, text=True
@@ -136,6 +156,28 @@ def ingest(db, source, filename, offset=0):
             for row in csv.reader(
                 process.stdout, delimiter="\t", quoting=csv.QUOTE_NONE
             ):
+                if len(row) != len(FIELDS):
+                    raise ValueError("Unexpected tshark field count")
+                timestamp = float(row[1])
+                if not math.isfinite(timestamp):
+                    raise ValueError("Non-finite timestamp")
+                captured = int(row[3])
+                quality["decoded_tcp_packets"] += 1
+                quality["truncated"] += captured < int(row[2])
+                if previous_timestamp is not None and timestamp < previous_timestamp:
+                    quality["timestamp_regressions"] += 1
+                previous_timestamp = timestamp
+                for key, value, aggregate in [
+                    ("raw_start", timestamp, min),
+                    ("raw_end", timestamp, max),
+                    ("min_captured_length", captured, min),
+                    ("max_captured_length", captured, max),
+                ]:
+                    quality[key] = (
+                        value
+                        if quality[key] is None
+                        else aggregate(quality[key], value)
+                    )
                 packet = parse_row(row, source, str(filename), offset)
                 if packet is None:
                     quality["incomplete_headers"] += 1
@@ -144,7 +186,6 @@ def ingest(db, source, filename, offset=0):
                     "INSERT INTO packets VALUES (" + ",".join(["?"] * 18) + ")", packet
                 )
                 quality["packets"] += 1
-                quality["truncated"] += packet[5] < packet[4]
                 if quality["packets"] % 10000 == 0:
                     db.commit()
                     print(
@@ -198,7 +239,7 @@ def report(db, quality, window=60, threshold=10):
         min(frame) first_frame, max(frame) last_frame
         FROM packets WHERE events != ''
         GROUP BY source, file, stream, CAST(ts / ? AS INTEGER)
-        HAVING count(*) >= ? ORDER BY event_packets DESC LIMIT 500""",
+        HAVING count(*) >= ? ORDER BY event_packets DESC, start, source, file, stream LIMIT 500""",
         (window, window, window, threshold),
     )
     for burst in bursts:
@@ -214,12 +255,13 @@ def report(db, quality, window=60, threshold=10):
         FROM packets GROUP BY source, CAST(ts / 60 AS INTEGER) ORDER BY minute""",
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "inputs": quality,
         "connections": connections,
         "bursts": bursts,
         "timeline": timeline,
         "comparison": compare(db),
+        "exports": [],
         "limitations": [
             "TCP analysis flags are observations, not proof of network failure.",
             "Wire and TCP byte counts include retransmissions and offload artifacts.",
@@ -240,11 +282,18 @@ def compare(db):
     ]
     if len(sources) != 2:
         return {"status": "requires_two_nonempty_sources"}
-    db.execute("""CREATE TEMP VIEW IF NOT EXISTS signatures AS
+    # Rebuild per report so callers may append observations between reports.
+    db.execute("DROP TABLE IF EXISTS temp.signatures")
+    db.execute("""CREATE TEMP TABLE signatures AS
         SELECT source, src, sport, dst, dport, seq, ack, length, flags, window,
         count(*) observations, min(ts) ts, min(frame) frame, min(file) file
         FROM packets GROUP BY source, src, sport, dst, dport, seq, ack, length, flags, window""")
     keys = ["src", "sport", "dst", "dport", "seq", "ack", "length", "flags", "window"]
+    db.execute(
+        "CREATE INDEX temp.signature_lookup ON signatures ("
+        + ",".join(keys + ["source"])
+        + ")"
+    )
     condition = " AND ".join(f"a.{key} = b.{key}" for key in keys)
     matches = records(
         db,
@@ -262,7 +311,7 @@ def compare(db):
         f"""SELECT a.source,
         sum(b.source IS NULL) signatures_not_observed_at_peer,
         sum(b.source IS NOT NULL AND (a.observations > 1 OR b.observations > 1)) ambiguous_signatures,
-        sum(a.observations = 1 AND b.observations = 1) unique_exact_matches
+        sum(CASE WHEN a.observations = 1 AND b.observations = 1 THEN 1 ELSE 0 END) unique_exact_matches
         FROM signatures a LEFT JOIN signatures b ON {condition} AND a.source != b.source
         GROUP BY a.source""",
     )
@@ -275,11 +324,95 @@ def compare(db):
     }
 
 
+def export_bursts(data, directory, limit, context):
+    """Export local-stream context, keeping original timestamps and truncation."""
+    if not 0 <= limit <= 500 or not math.isfinite(context) or context < 0:
+        raise ValueError(
+            "export limit must be 0..500 and context finite and nonnegative"
+        )
+    if not limit or not data["bursts"]:
+        return []
+    destination = directory / "evidence"
+    destination.mkdir(exist_ok=False)
+    inputs = {(item["source"], item["file"]): item for item in data["inputs"]}
+    exports = []
+    for number, burst in enumerate(data["bursts"][:limit], 1):
+        offset = inputs[burst["source"], burst["file"]]["offset_seconds"]
+        start, end = burst["start"] - offset - context, burst["end"] - offset + context
+        expression = (
+            f"tcp.stream == {burst['stream']} && "
+            f"frame.time_epoch >= {start:.9f} && frame.time_epoch < {end:.9f}"
+        )
+        name = f"burst-{number:03d}-{burst['source']}.pcapng"
+        entry = {
+            "source": burst["source"],
+            "original_file": burst["file"],
+            "original_stream": burst["stream"],
+            "first_event_frame": burst["first_frame"],
+            "last_event_frame": burst["last_frame"],
+            "raw_start": start,
+            "raw_end": end,
+            "context_seconds": context,
+            "wireshark_filter": expression,
+        }
+        # Publish only completed exports. Each export rereads its original file.
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".export-", dir=destination
+            ) as temporary:
+                output = Path(temporary) / name
+                with tempfile.TemporaryFile(mode="w+t") as errors:
+                    result = subprocess.run(
+                        [
+                            "tshark",
+                            "-n",
+                            "-r",
+                            burst["file"],
+                            "-Y",
+                            expression,
+                            "-F",
+                            "pcapng",
+                            "-w",
+                            str(output),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=errors,
+                        text=True,
+                    )
+                    errors.seek(0)
+                    entry["diagnostics"] = errors.read(16384)
+                if result.returncode:
+                    raise RuntimeError(f"tshark export failed ({result.returncode})")
+                if not output.is_file() or not output.stat().st_size:
+                    raise RuntimeError("tshark produced no capture file")
+                output.rename(destination / name)
+            entry.update(status="ok", path=f"evidence/{name}")
+        except (OSError, RuntimeError) as error:
+            entry.update(status="failed", error=str(error))
+        exports.append(entry)
+    return exports
+
+
 def write_report(data, directory):
     (directory / "report.json").write_text(
         json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     sections = []
+    if data.get("exports"):
+        links = []
+        for entry in data["exports"]:
+            if entry["status"] == "ok":
+                path = html.escape(entry["path"], quote=True)
+                links.append(f'<li><a href="{path}">{path}</a></li>')
+            else:
+                links.append(
+                    "<li>Export failed: " + html.escape(entry["error"]) + "</li>"
+                )
+        sections.append(
+            "<h2>Evidence captures</h2><p>Original timestamps and truncation retained; "
+            "frame numbers and stream IDs are reassigned in exported files. "
+            "Filters below refer to original inputs.</p><ul>" + "".join(links) + "</ul>"
+        )
     for key in ["inputs", "connections", "bursts", "timeline"]:
         rows = data[key]
         headers = list(rows[0]) if rows else []
@@ -336,9 +469,29 @@ def main(argv=None):
     parser.add_argument(
         "--output", type=Path, required=True, help="New output directory"
     )
+    parser.add_argument(
+        "--export-bursts",
+        type=int,
+        default=0,
+        help="Export the top N anomaly windows (0..500; default: disabled)",
+    )
+    parser.add_argument(
+        "--context",
+        type=float,
+        default=5,
+        help="Seconds of same-stream context on each side of exported windows",
+    )
     args = parser.parse_args(argv)
     if args.window <= 0 or args.threshold <= 0 or not math.isfinite(args.offset_b):
         parser.error("window and threshold must be positive; offset must be finite")
+    if (
+        not 0 <= args.export_bursts <= 500
+        or not math.isfinite(args.context)
+        or args.context < 0
+    ):
+        parser.error(
+            "export-bursts must be 0..500; context must be finite and nonnegative"
+        )
     if not shutil.which("tshark"):
         parser.error("tshark is required; install it before running analysis")
     files = args.a + args.b
@@ -357,11 +510,20 @@ def main(argv=None):
             ]:
                 for path in paths:
                     quality.append(ingest(db, source, path.resolve(), offset))
-            write_report(report(db, quality, args.window, args.threshold), args.output)
+            data = report(db, quality, args.window, args.threshold)
+            data["exports"] = export_bursts(
+                data, args.output, args.export_bursts, args.context
+            )
+            write_report(data, args.output)
     except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
         print(f"Analysis failed: {error}", file=sys.stderr)
         return 1
     print(args.output / "report.html")
+    if any(entry["status"] == "failed" for entry in data["exports"]):
+        print(
+            "Some evidence exports failed; see report.json for details", file=sys.stderr
+        )
+        return 1
     return 0
 
 

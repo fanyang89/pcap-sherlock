@@ -1,0 +1,16 @@
+name: Tests
+on: [push, pull_request]
+jobs:
+  tcp-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install tshark
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+      - name: Run unit and capture workflow tests
+        run: python -m unittest discover -s tests -v

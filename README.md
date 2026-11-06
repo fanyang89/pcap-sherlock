@@ -7,6 +7,8 @@
 ```bash
 python3 sherlock.py --a client.pcap --b server.pcap --output analysis
 python3 sherlock.py --a client-1.pcap client-2.pcap --b server.pcap --offset-b -0.25 --output aligned
+# 导出排名前 5 个异常窗口，保留同连接前后各 5 秒上下文
+python3 sherlock.py --a client.pcap --b server.pcap --export-bursts 5 --context 5 --output evidence-analysis
 python3 -m unittest discover -s tests -v
 ```
 
@@ -20,13 +22,35 @@ python3 -m unittest discover -s tests -v
 载荷截断但 TCP 头部完整的报文可以分析；捕获长度和原始长度分别保存。
 tshark 失败会非零退出，不生成成功报告，可能保留部分索引供检查。
 
+### 抓包质量与证据导出
+
+输入统计包含已解码 TCP 包数、可索引包数、头部不完整数、截断数、原始时间范围、
+捕获长度范围及按文件顺序观察到的时间戳倒退次数。截断统计包含被跳过的不完整头部记录。
+TCP 固定头部及声明的选项必须完整才能进入索引；最大捕获长度不是配置 snaplen 的推断值。
+时间戳倒退是观测，不直接断言发生了校时或网络乱序。
+
+`--export-bursts N` 默认关闭，最多 500；按异常窗口排名导出，每个文件只包含
+该异常所属原始文件、同一 TCP stream 的双向报文及时间上下文。
+不会自动补齐另一端或相邻轮转文件。每个导出都重新扫描一次原始文件，建议先导出少量重点窗口。
+
+导出文件位于 `evidence/*.pcapng`，报告提供直接打开的链接。
+原始时间戳、载荷截断保留不变；手动时间偏移只参与选择区间。
+`report.json` 的 `exports` 记录源文件、原 stream、事件包号范围、原始时间范围、
+过滤器和导出状态。导出文件会重新分配包号与 stream，不能把原文件过滤器直接套到导出文件。
+tshark 还可能写入匹配报文依赖的分片；上下文不保证包含完整握手或完整会话。
+单项导出失败会记录错误并清理该项临时文件，其他导出和分析报告仍保留，命令最终非零退出。
+
+JSON 当前 `schema_version` 为 2。无对端匹配时计数为 0；两端签名先聚合为临时索引再关联，
+重复头部仍按歧义处理。测试包含动态生成的截断 TCP 抓包及导出回读；
+本机没有 tshark 时这两项集成测试会明确跳过，GitHub Actions 配置为安装 tshark 后运行全部测试。
+
 ### 当前限制
 
 - 两端关联采用地址、端口、原始序列号、ACK、长度、标志和窗口的精确头部候选匹配；重复签名标记为歧义。
 - 未观察到匹配不代表链路丢包；TCP 分析标记不是故障证明。两端时间差包含时钟误差，不是单向时延。
 - 字节计数包含重传及 offload 影响，不代表应用有效吞吐。
 - 只索引 tshark 已解码的 TCP；头部不完整记录跳过并计数。各文件 stream 独立，轮转会话尚未合并。
-- 序列范围重组、TSO/GRO 分段差异、NAT／四元组复用消歧、自动时钟校准、握手耗时与无进展检测、证据 PCAP 导出、图形下钻尚未实现。
+- 序列范围重组、TSO/GRO 分段差异、NAT／四元组复用消歧、自动时钟校准、握手耗时与无进展检测、图形下钻尚未实现。
 - 全天真实抓包的耗时、内存及报告体积尚待验收。
 
 ## 旧版异常计数工具

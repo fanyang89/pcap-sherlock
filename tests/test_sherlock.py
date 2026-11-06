@@ -1,11 +1,20 @@
 import sqlite3
+import subprocess
 import unittest
 import io
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from sherlock import FIELDS, initialize, parse_row, report, ingest, write_report
+from sherlock import (
+    FIELDS,
+    initialize,
+    parse_row,
+    report,
+    ingest,
+    write_report,
+    export_bursts,
+)
 
 
 def row(**values):
@@ -26,6 +35,9 @@ def row(**values):
             "tcp.len": "1446",
             "tcp.flags": "0x0010",
             "tcp.window_size_value": "4096",
+            "tcp.hdr_len": "20",
+            "tcp.checksum": "0x0000",
+            "tcp.urgent_pointer": "0",
         }
     )
     fields.update(values)
@@ -71,6 +83,23 @@ class AnalysisTests(unittest.TestCase):
     def test_missing_tcp_header_skipped(self):
         self.assertIsNone(parse_row(row(**{"tcp.seq_raw": ""}), "A", "a.pcap"))
 
+    def test_partial_tcp_options_skipped(self):
+        self.assertIsNone(
+            parse_row(row(**{"tcp.hdr_len": "32", "tcp.options": "0101"}), "A", "a")
+        )
+        self.assertIsNotNone(
+            parse_row(
+                row(**{"tcp.hdr_len": "24", "tcp.options": "02:04:05:b4"}), "A", "a"
+            )
+        )
+
+    def test_unmatched_signatures_have_zero_matches(self):
+        self.add()
+        self.add("B", **{"tcp.seq_raw": "8000"})
+        for item in report(self.db, [])["comparison"]["counts"]:
+            self.assertEqual(item["unique_exact_matches"], 0)
+            self.assertEqual(item["signatures_not_observed_at_peer"], 1)
+
     def test_offset_and_ipv6(self):
         packet = parse_row(
             row(**{"ip.src": "", "ipv6.src": "2001:db8::1"}), "B", "b", -2
@@ -105,6 +134,87 @@ class AnalysisTests(unittest.TestCase):
             quality = ingest(self.db, "A", "a.pcap")
             self.assertEqual(quality["truncated"], 1)
             self.assertEqual(quality["packets"], 1)
+
+    def test_quality_includes_skipped_headers_and_clock_regressions(self):
+        rows = [
+            row(),
+            row(
+                **{
+                    "frame.number": "2",
+                    "frame.time_epoch": "110",
+                    "tcp.urgent_pointer": "",
+                }
+            ),
+        ]
+        with patch("sherlock.subprocess.Popen") as popen:
+            process = popen.return_value
+            process.stdout = io.StringIO("\n".join("\t".join(r) for r in rows) + "\n")
+            process.wait.return_value = 0
+            process.poll.return_value = 0
+            quality = ingest(self.db, "A", "a.pcap", 10)
+        self.assertEqual(quality["decoded_tcp_packets"], 2)
+        self.assertEqual(quality["packets"], 1)
+        self.assertEqual(quality["truncated"], 2)
+        self.assertEqual(quality["incomplete_headers"], 1)
+        self.assertEqual(quality["timestamp_regressions"], 1)
+        self.assertEqual((quality["raw_start"], quality["raw_end"]), (110, 120))
+
+    def export_data(self):
+        self.add("B", **{"tcp.flags": "0x0004"})
+        return report(
+            self.db,
+            [{"source": "B", "file": "B.pcap", "offset_seconds": 0.25}],
+            threshold=1,
+        )
+
+    def test_export_uses_raw_time_and_context(self):
+        data = self.export_data()
+
+        def fake_export(command, **kwargs):
+            self.assertIn(
+                "tcp.stream == 0 && frame.time_epoch >= 114.750000000 && frame.time_epoch < 184.750000000",
+                command,
+            )
+            Path(command[command.index("-w") + 1]).write_bytes(b"pcapng")
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("sherlock.subprocess.run", side_effect=fake_export),
+        ):
+            exports = export_bursts(data, Path(tmp), 1, 5)
+            self.assertEqual(exports[0]["status"], "ok")
+            self.assertEqual((Path(tmp) / exports[0]["path"]).read_bytes(), b"pcapng")
+            data["exports"] = exports
+            write_report(data, Path(tmp))
+            self.assertIn(
+                'href="evidence/burst-001-B.pcapng"',
+                (Path(tmp) / "report.html").read_text(),
+            )
+
+    def test_failed_export_leaves_no_partial_capture(self):
+        def failed_export(command, **kwargs):
+            Path(command[command.index("-w") + 1]).write_bytes(b"partial")
+            kwargs["stderr"].write("corrupt input")
+            return subprocess.CompletedProcess(command, 2)
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("sherlock.subprocess.run", side_effect=failed_export),
+        ):
+            exports = export_bursts(self.export_data(), Path(tmp), 1, 5)
+            self.assertEqual(exports[0]["status"], "failed")
+            self.assertEqual(exports[0]["diagnostics"], "corrupt input")
+            self.assertEqual(list((Path(tmp) / "evidence").iterdir()), [])
+
+    def test_export_disabled_has_no_side_effects(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("sherlock.subprocess.run") as run,
+        ):
+            self.assertEqual(export_bursts(self.export_data(), Path(tmp), 0, 5), [])
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+            run.assert_not_called()
 
 
 if __name__ == "__main__":
