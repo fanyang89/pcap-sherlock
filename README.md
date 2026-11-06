@@ -1,4 +1,35 @@
-# PCAP异常检测工具
+# PCAP Sherlock
+
+## TCP 两端分析入口
+
+新入口 `sherlock.py` 使用 SQLite 磁盘索引和流式 tshark 输出，仅需 Python 3.10+ 和 tshark。
+
+```bash
+python3 sherlock.py --a client.pcap --b server.pcap --output analysis
+python3 sherlock.py --a client-1.pcap client-2.pcap --b server.pcap --offset-b -0.25 --output aligned
+python3 -m unittest discover -s tests -v
+```
+
+输出目录必须尚不存在。`--b` 可省略以执行单点分析；`--offset-b` 是加到 B 端时间上的秒数。
+`--window` 默认 60 秒，`--threshold` 默认 10 个事件包，使用 epoch 对齐的固定窗口。
+
+输出 `report.html`（离线可折叠表格）、`report.json` 和 `index.sqlite`。
+报告包含方向级连接统计、重传／重复 ACK／乱序／零窗口／RST、可用 ACK RTT、
+分钟趋势、最多 500 个异常窗口及最多 1000 对两端证据样例，匹配总数单独统计。
+保留原始文件与包号；报告中的 TCP stream 过滤器必须用于对应文件。
+载荷截断但 TCP 头部完整的报文可以分析；捕获长度和原始长度分别保存。
+tshark 失败会非零退出，不生成成功报告，可能保留部分索引供检查。
+
+### 当前限制
+
+- 两端关联采用地址、端口、原始序列号、ACK、长度、标志和窗口的精确头部候选匹配；重复签名标记为歧义。
+- 未观察到匹配不代表链路丢包；TCP 分析标记不是故障证明。两端时间差包含时钟误差，不是单向时延。
+- 字节计数包含重传及 offload 影响，不代表应用有效吞吐。
+- 只索引 tshark 已解码的 TCP；头部不完整记录跳过并计数。各文件 stream 独立，轮转会话尚未合并。
+- 序列范围重组、TSO/GRO 分段差异、NAT／四元组复用消歧、自动时钟校准、握手耗时与无进展检测、证据 PCAP 导出、图形下钻尚未实现。
+- 全天真实抓包的耗时、内存及报告体积尚待验收。
+
+## 旧版异常计数工具
 
 这是一个用于分析PCAP文件中异常值集中出现时间点的Python工具集。该工具可以帮助网络管理员和安全分析师识别网络流量中的异常模式和潜在问题。
 
